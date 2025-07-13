@@ -384,8 +384,11 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range):
             output_rows.append(row)
 
         output_df = pd.DataFrame(output_rows)
+        # Reorder columns: Name, Designation, Total Duties, Assigned Slot, then dates
         output_df.insert(0, 'Name', output_df.pop('Name'))
         output_df.insert(1, 'Designation', output_df.pop('Designation'))
+        output_df.insert(2, 'Total Duties', output_df.pop('Total Duties'))
+        output_df.insert(3, 'Assigned Slot', output_df.pop('Assigned Slot'))
         output_df.to_excel(output_path, index=False)
 
         # Summarize
