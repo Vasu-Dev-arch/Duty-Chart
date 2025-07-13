@@ -18,9 +18,15 @@ logging.basicConfig(filename='duty_chart_app.log', level=logging.DEBUG, format='
 def normalize_name(name):
     if pd.isna(name):
         return ""
+    # Remove titles and extra spaces, preserve order
     cleaned = re.sub(r"^(Dr\.?|Prof\.?|Mr\.?|Mrs\.?|Ms\.?)\s*", "", str(name).strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
-    return cleaned
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Replace periods in initials with spaces for consistency
+    cleaned = re.sub(r"\.(?=\w)", " ", cleaned)
+    # Split into components and lowercase
+    parts = cleaned.split()
+    parts = [part.lower() for part in parts if part]
+    return ' '.join(parts)
 
 def normalize_designation(desig):
     if pd.isna(desig):
@@ -34,12 +40,38 @@ def normalize_designation(desig):
     }
     return designation_map.get(desig, desig.title())
 
-def fuzzy_match_name(name1, secondary_name, threshold=0.9):
+def fuzzy_match_name(staff_name, pref_name, threshold=0.65):
     try:
-        score = SequenceMatcher(None, name1.lower(), secondary_name.lower()).ratio()
-        return score >= threshold
+        # Normalize both names
+        staff_norm = normalize_name(staff_name)
+        pref_norm = normalize_name(pref_name)
+        staff_parts = staff_norm.split()
+        pref_parts = pref_norm.split()
+        
+        # Check for common significant parts (length > 3)
+        common_parts = set(staff_parts) & set(pref_parts)
+        if any(len(part) > 3 for part in common_parts):
+            logging.info(f"Fuzzy matched {pref_name} to {staff_name} based on significant part: {common_parts}")
+            return True
+        
+        # Calculate similarity score on normalized names
+        score = SequenceMatcher(None, staff_norm, pref_norm).ratio()
+        logging.debug(f"Fuzzy match attempt: {staff_name} vs {pref_name}, normalized: {staff_norm} vs {pref_norm}, score: {score:.3f}")
+        
+        # Additional check with raw names (no spaces or punctuation)
+        staff_raw = re.sub(r"[.\s]+", "", staff_name.lower())
+        pref_raw = re.sub(r"[.\s]+", "", pref_name.lower())
+        raw_score = SequenceMatcher(None, staff_raw, pref_raw).ratio()
+        logging.debug(f"Raw match attempt: {staff_raw} vs {pref_raw}, score: {raw_score:.3f}")
+        
+        if score >= threshold or raw_score >= 0.9:
+            logging.info(f"Fuzzy matched {pref_name} to {staff_name} with score {max(score, raw_score):.3f}")
+            return True
+        
+        logging.debug(f"No match for {staff_name} vs {pref_name}, scores: normalized={score:.3f}, raw={raw_score:.3f}, threshold={threshold}")
+        return False
     except Exception as e:
-        logging.error(f"Fuzzy match failed for {name1} vs {secondary_name}: {e}")
+        logging.error(f"Fuzzy match failed for {staff_name} vs {pref_name}: {e}")
         return False
 
 def find_column(df, keywords):
@@ -176,19 +208,33 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range):
         unmatched_pref = pref_names - staff_names
         fuzzy_matches = {}
         for staff_name in unmatched_staff:
+            staff_original = staff_df[staff_df['name'] == staff_name]['original_name'].iloc[0]
+            best_score = 0
+            best_match = None
             for pref_name in unmatched_pref:
-                if fuzzy_match_name(staff_name, pref_name):
-                    fuzzy_matches[pref_name] = staff_name
-                    logging.info(f"Fuzzy matched {pref_name} (Preference) to {staff_name} (Staff)")
+                pref_original = pref_df[pref_df['name'] == pref_name]['original_name'].iloc[0]
+                if fuzzy_match_name(staff_original, pref_original):
+                    score = SequenceMatcher(None, normalize_name(staff_original), normalize_name(pref_original)).ratio()
+                    raw_score = SequenceMatcher(None, re.sub(r"[.\s]+", "", staff_original.lower()), re.sub(r"[.\s]+", "", pref_original.lower())).ratio()
+                    final_score = max(score, raw_score)
+                    if final_score > best_score:
+                        best_score = final_score
+                        best_match = pref_name
+            if best_match:
+                fuzzy_matches[best_match] = staff_name
+                logging.info(f"Fuzzy matched {pref_df[pref_df['name'] == best_match]['original_name'].iloc[0]} (Preference) to {staff_original} (Staff) with score {best_score:.3f}")
+        
         if fuzzy_matches:
             pref_df['name'] = pref_df['name'].replace(fuzzy_matches)
             unmatched_pref = pref_names - staff_names - set(fuzzy_matches.keys())
             unmatched_staff = staff_names - pref_names - set(fuzzy_matches.values())
 
         if unmatched_staff:
-            logging.info(f"Staff names not in Slot Preference (defaulting to Any): {unmatched_staff}")
+            unmatched_original = [staff_df[staff_df['name'] == n]['original_name'].iloc[0] for n in unmatched_staff]
+            logging.info(f"Staff names not in Slot Preference (defaulting to Any): {unmatched_original}")
         if unmatched_pref:
-            logging.warning(f"Preference names not in Staff List (ignored): {unmatched_pref}")
+            unmatched_original = [pref_df[pref_df['name'] == n]['original_name'].iloc[0] for n in unmatched_pref]
+            logging.warning(f"Preference names not in Staff List (ignored): {unmatched_original}")
             pref_df = pref_df[pref_df['name'].isin(staff_names)]
 
         # Merge data
