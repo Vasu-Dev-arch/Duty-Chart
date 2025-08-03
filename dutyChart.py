@@ -1,20 +1,23 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkcalendar import DateEntry
-import math
+from datetime import timedelta
 import pandas as pd
+import numpy as np
+from datetime import datetime
 import re
 import os
-from datetime import datetime, timedelta
-from difflib import SequenceMatcher
+import math
 import logging
-from tkinter import messagebox
+from difflib import SequenceMatcher
 
-logging.basicConfig(filename='duty_chart_app.log', level=logging.DEBUG,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+# Setup logging
+logging.basicConfig(filename='duty_chart_app.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# ----------------------------- Helper Functions -----------------------------
 def normalize_name(name):
-    if pd.isna(name): return ""
+    if pd.isna(name):
+        return ""
     cleaned = re.sub(r"^(Dr\.?|Prof\.?|Mr\.?|Mrs\.?|Ms\.?)\s*", "", str(name).strip(), flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     cleaned = re.sub(r"\.(?=\w)", " ", cleaned)
@@ -22,7 +25,8 @@ def normalize_name(name):
     return ' '.join(parts)
 
 def normalize_designation(desig):
-    if pd.isna(desig): return ""
+    if pd.isna(desig):
+        return ""
     desig = str(desig).strip().lower()
     designation_map = {
         'professor': 'Professor', 'prof': 'Professor',
@@ -38,27 +42,43 @@ def fuzzy_match_name(staff_name, pref_name, threshold=0.65):
         pref_norm = normalize_name(pref_name)
         staff_parts = staff_norm.split()
         pref_parts = pref_norm.split()
-        if set(staff_parts) & set(pref_parts):
+        
+        common_parts = set(staff_parts) & set(pref_parts)
+        if any(len(part) > 3 for part in common_parts):
+            logging.info(f"Fuzzy matched {pref_name} to {staff_name} based on significant part: {common_parts}")
             return True
+        
         score = SequenceMatcher(None, staff_norm, pref_norm).ratio()
-        staff_raw = re.sub(r"[.\s]+", "", str(staff_name).lower())
-        pref_raw = re.sub(r"[.\s]+", "", str(pref_name).lower())
+        logging.debug(f"Fuzzy match attempt: {staff_name} vs {pref_name}, normalized: {staff_norm} vs {pref_norm}, score: {score:.3f}")
+        
+        staff_raw = re.sub(r"[.\s]+", "", staff_name.lower())
+        pref_raw = re.sub(r"[.\s]+", "", pref_name.lower())
         raw_score = SequenceMatcher(None, staff_raw, pref_raw).ratio()
-        return score >= threshold or raw_score >= 0.9
+        logging.debug(f"Raw match attempt: {staff_raw} vs {pref_raw}, score: {raw_score:.3f}")
+        
+        if score >= threshold or raw_score >= 0.9:
+            logging.info(f"Fuzzy matched {pref_name} to {staff_name} with score {max(score, raw_score):.3f}")
+            return True
+        
+        logging.debug(f"No match for {staff_name} vs {pref_name}, scores: normalized={score:.3f}, raw={raw_score:.3f}, threshold={threshold}")
+        return False
     except Exception as e:
-        logging.error(f"Fuzzy match failed for {staff_name} {pref_name}: {e}")
+        logging.error(f"Fuzzy match failed for {staff_name} vs {pref_name}: {e}")
         return False
 
 def find_column(df, keywords):
     for col in df.columns:
         col_clean = col.strip().lower().replace('\n', '').replace('\r', '')
         if any(keyword.lower() in col_clean for keyword in keywords):
+            logging.info(f"Found column '{col}' matching keywords {keywords}")
             return col
+    logging.warning(f"No column found matching keywords {keywords}")
     return None
 
 def safe_parse_date(val):
     try:
-        if pd.isna(val): return None
+        if pd.isna(val):
+            return None
         if isinstance(val, (int, float)):
             base_date = datetime(1899, 12, 30)
             return (base_date + timedelta(days=int(val))).date()
@@ -72,51 +92,68 @@ def safe_parse_date(val):
 def parse_timestamp(ts):
     try:
         parsed = pd.to_datetime(ts, errors='coerce')
-        if pd.isna(parsed): return pd.NaT
+        if pd.isna(parsed):
+            logging.error(f"Invalid timestamp: {ts}")
+            return pd.NaT
         return parsed.tz_localize(None)
     except Exception as e:
         logging.error(f"Failed to parse timestamp {ts}: {e}")
         return pd.NaT
 
-def can_assign(name, date, used_on_day):
-    if date not in used_on_day: return True
-    return name not in used_on_day[date]
-
+# ----------------------------- Duty Chart Generator -----------------------------
 def generate_duty_chart(input_path, output_path, slot1_range, slot2_range, ratio_choice):
     try:
         input_path = input_path.strip('"').strip()
         output_path = output_path.strip('"').strip()
+        logging.info(f"Input path: {input_path}, Output path: {output_path}, Ratio: {ratio_choice}")
+
         if not os.path.exists(input_path):
+            logging.error(f"Input file not found: {input_path}")
             messagebox.showerror("Error", f"Input file not found: {input_path}")
-            return None, [], [], [], {}
+            return None, None, None, None, {}
 
-        # Load sheets
         xls = pd.ExcelFile(input_path)
-        sheets = {s.strip().lower().replace('\n','').replace('\r',''):s for s in xls.sheet_names}
-        def get_sheet(variants):
-            for v in variants:
-                vclean = v.strip().lower().replace('\n','').replace('\r','')
-                if vclean in sheets:
-                    return sheets[vclean]
-            return None
-        session_sheet = get_sheet(['session strength', 'sessionwise strength'])
-        staff_sheet = get_sheet(['staff list', 'staff details'])
-        pref_sheet = get_sheet(['slot preference'])
-        if not session_sheet or not staff_sheet or not pref_sheet:
-            messagebox.showerror("Error", "Required sheets missing in input Excel.")
-            return None, [], [], [], {}
+        sheets = {s.strip().lower().replace('\n', '').replace('\r', ''): s for s in xls.sheet_names}
 
-        session_df = pd.read_excel(xls, session_sheet)
-        staff_df = pd.read_excel(xls, staff_sheet)
-        pref_df = pd.read_excel(xls, pref_sheet)
+        sheet_map = {
+            'session strength': ['Session Strength', 'Sessionwise Strength'],
+            'staff list': ['Staff List', 'Staff Details'],
+            'slot preference': ['Slot Preference']
+        }
+        found_sheets = {}
+        for key, variations in sheet_map.items():
+            for variation in variations:
+                if variation.strip().lower().replace('\n', '').replace('\r', '') in sheets:
+                    found_sheets[key] = sheets[variation.strip().lower().replace('\n', '').replace('\r', '')]
+                    break
+            if key not in found_sheets:
+                logging.error(f"Missing sheet: {key}. Found sheets: {', '.join(xls.sheet_names)}")
+                messagebox.showerror("Error", f"Missing sheet: {key}. Found sheets: {', '.join(xls.sheet_names)}")
+                return None, None, None, None, {}
 
-        session_df.columns = [c.strip().lower().replace('\n','').replace('\r','') for c in session_df.columns]
-        staff_df.columns = [c.strip().lower().replace('\n','').replace('\r','') for c in staff_df.columns]
-        pref_df.columns = [c.strip().lower().replace('\n','').replace('\r','') for c in pref_df.columns]
+        session_df = pd.read_excel(xls, found_sheets['session strength'])
+        staff_df = pd.read_excel(xls, found_sheets['staff list'])
+        pref_df = pd.read_excel(xls, found_sheets['slot preference'])
 
-        session_cols = {'date': find_column(session_df, ['date']), 'fn': find_column(session_df, ['fn', 'forenoon', 'morning']), 'an': find_column(session_df, ['an', 'afternoon'])}
-        staff_cols = {'name': find_column(staff_df, ['name']), 'designation': find_column(staff_df, ['designation'])}
-        pref_cols = {'timestamp': find_column(pref_df, ['timestamp']), 'name': find_column(pref_df, ['name']), 'preferred slot': find_column(pref_df, ['preferred slot', 'slot'])}
+        session_df.columns = [c.strip().lower().replace('\n', '').replace('\r', '') for c in session_df.columns]
+        staff_df.columns = [c.strip().lower().replace('\n', '').replace('\r', '') for c in staff_df.columns]
+        pref_df.columns = [c.strip().lower().replace('\n', '').replace('\r', '') for c in pref_df.columns]
+
+        session_cols = {
+            'date': find_column(session_df, ['date']),
+            'fn': find_column(session_df, ['fn', 'forenoon', 'morning']),
+            'an': find_column(session_df, ['an', 'afternoon'])
+        }
+        staff_cols = {
+            'name': find_column(staff_df, ['name of the faculty', 'name', 'faculty']),
+            'designation': find_column(staff_df, ['designation', 'design', 'desig']),
+            'department': find_column(staff_df, ['department', 'dept'])
+        }
+        pref_cols = {
+            'timestamp': find_column(pref_df, ['timestamp']),
+            'name': find_column(pref_df, ['name of the faculty', 'name', 'faculty']),
+            'preferred slot': find_column(pref_df, ['preferred slot', 'slot', 'preferredslot'])
+        }
 
         missing_cols = []
         for df_name, cols in [('Session Strength', session_cols), ('Staff List', staff_cols), ('Slot Preference', pref_cols)]:
@@ -124,12 +161,14 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range, ratio
                 if col is None:
                     missing_cols.append(f"{col_name} in {df_name}")
         if missing_cols:
+            logging.error(f"Missing columns: {', '.join(missing_cols)}")
             messagebox.showerror("Error", f"Missing columns: {', '.join(missing_cols)}")
-            return None, [], [], [], {}
+            return None, None, None, None, {}
 
-        session_df = session_df.rename(columns={session_cols['date']:'date', session_cols['fn']:'fn', session_cols['an']:'an'})
-        staff_df = staff_df.rename(columns={staff_cols['name']:'name', staff_cols['designation']:'designation'})
-        pref_df = pref_df.rename(columns={pref_cols['timestamp']:'timestamp', pref_cols['name']:'name', pref_cols['preferred slot']:'preferred slot'})
+        session_df = session_df.rename(columns={session_cols['date']: 'date', session_cols['fn']: 'fn', session_cols['an']: 'an'})
+        staff_df = staff_df.rename(columns={staff_cols['name']: 'name', staff_cols['designation']: 'designation', staff_cols['department']: 'department'})
+        pref_df = pref_df.rename(columns={pref_cols['timestamp']: 'timestamp', pref_cols['name']: 'name', 
+                                         pref_cols['preferred slot']: 'preferred slot'})
 
         session_df['date'] = session_df['date'].apply(safe_parse_date)
         session_df = session_df.dropna(subset=['date'])
@@ -147,28 +186,45 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range, ratio
         pref_df['timestamp'] = pref_df['timestamp'].apply(parse_timestamp)
         pref_df = pref_df.sort_values('timestamp').drop_duplicates(subset=['name'], keep='last')
 
-        # fuzzy matching pref names to staff names if needed
         staff_names = set(staff_df['name'])
         pref_names = set(pref_df['name'])
-        unmatched_pref = pref_names - staff_names
         unmatched_staff = staff_names - pref_names
+        unmatched_pref = pref_names - staff_names
         fuzzy_matches = {}
-        for p_name in unmatched_pref:
-            for s_name in unmatched_staff:
-                if fuzzy_match_name(s_name, p_name):
-                    fuzzy_matches[p_name] = s_name
-                    break
-        pref_df['name'] = pref_df['name'].replace(fuzzy_matches)
-        pref_df = pref_df[pref_df['name'].isin(staff_names)]
+        for staff_name in unmatched_staff:
+            staff_original = staff_df[staff_df['name'] == staff_name]['original_name'].iloc[0]
+            best_score = 0
+            best_match = None
+            for pref_name in unmatched_pref:
+                pref_original = pref_df[pref_df['name'] == pref_name]['original_name'].iloc[0]
+                if fuzzy_match_name(staff_original, pref_original):
+                    score = SequenceMatcher(None, normalize_name(staff_original), normalize_name(pref_original)).ratio()
+                    raw_score = SequenceMatcher(None, re.sub(r"[.\s]+", "", staff_original.lower()), re.sub(r"[.\s]+", "", pref_original.lower())).ratio()
+                    final_score = max(score, raw_score)
+                    if final_score > best_score:
+                        best_score = final_score
+                        best_match = pref_name
+            if best_match:
+                fuzzy_matches[best_match] = staff_name
+                logging.info(f"Fuzzy matched {pref_df[pref_df['name'] == best_match]['original_name'].iloc[0]} (Preference) to {staff_original} (Staff) with score {best_score:.3f}")
+        
+        if fuzzy_matches:
+            pref_df['name'] = pref_df['name'].replace(fuzzy_matches)
+            unmatched_pref = pref_names - staff_names - set(fuzzy_matches.keys())
+            unmatched_staff = staff_names - pref_names - set(fuzzy_matches.values())
 
-        merged_df = pd.merge(
-            staff_df[['name', 'original_name', 'designation']],
-            pref_df[['name', 'original_name', 'timestamp', 'preferred slot']],
-            on='name', how='left'
-        )
+        if unmatched_staff or unmatched_pref:
+            unmatched_staff_orig = [staff_df[staff_df['name'] == n]['original_name'].iloc[0] for n in unmatched_staff]
+            unmatched_pref_orig = [pref_df[pref_df['name'] == n]['original_name'].iloc[0] for n in unmatched_pref]
+            logging.warning(f"Unmatched staff (defaulting to Any): {unmatched_staff_orig}, Unmatched preferences (ignored): {unmatched_pref_orig}")
+            pref_df = pref_df[pref_df['name'].isin(staff_names)]
+
+        merged_df = pd.merge(staff_df[['name', 'original_name', 'designation', 'department']], 
+                            pref_df[['name', 'original_name', 'timestamp', 'preferred slot']], 
+                            on='name', how='left')
         merged_df['preferred slot'] = merged_df['preferred slot'].fillna('Any')
         merged_df['original_name_x'] = merged_df['original_name_x'].fillna(merged_df['name'])
-        merged_df = merged_df.rename(columns={'original_name_x':'original_name'}).drop(columns=['original_name_y'], errors='ignore')
+        merged_df = merged_df.rename(columns={'original_name_x': 'original_name'}).drop(columns=['original_name_y'], errors='ignore')
         merged_df = merged_df.drop_duplicates(subset=['name'])
 
         all_dates = sorted(session_df['date'].unique())
@@ -178,144 +234,167 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range, ratio
                 slot_dates['Slot 1'].add(d)
             elif slot2_range[0] <= d <= slot2_range[1]:
                 slot_dates['Slot 2'].add(d)
+        logging.info(f"Slot 1 dates: {sorted(slot_dates['Slot 1'])}, Slot 2 dates: {sorted(slot_dates['Slot 2'])}")
 
-        sessions = []
-        for _, row in session_df.iterrows():
-            for label in ['fn','an']:
-                count = row[label]
-                if count > 0:
-                    date = row["date"]
-                    sessions.append((date, label.upper(), math.ceil(count / 30), count))
-        sessions.sort(key=lambda x: (x[0], x[1]))
+        slot1_duties = sum(math.ceil(row[s] / 30) for _, row in session_df.iterrows() for s in ['fn', 'an'] if row['date'] in slot_dates['Slot 1'])
+        slot2_duties = sum(math.ceil(row[s] / 30) for _, row in session_df.iterrows() for s in ['fn', 'an'] if row['date'] in slot_dates['Slot 2'])
+        logging.info(f"Slot 1 needs {slot1_duties} duties, Slot 2 needs {slot2_duties} duties")
 
-        # User-selected duty ratio caps
-        ratio_map = {
-            '1:3:6': {'Professor': 1, 'Assoc. Professor': 3, 'Asst. Professor': 6},
-            '1:3:7': {'Professor': 1, 'Assoc. Professor': 3, 'Asst. Professor': 7},
-            '1:4:8': {'Professor': 1, 'Assoc. Professor': 4, 'Asst. Professor': 8},
-        }
-        if ratio_choice not in ratio_map:
-            messagebox.showerror("Error", f"Invalid duty ratio selected: {ratio_choice}")
-            return None, [], [], [], {}
-        designation_caps = ratio_map[ratio_choice]
-        designation_caps['A.P(Contract)'] = float('inf')
+        sessions = [(row['date'], s, math.ceil(row[s] / 30)) for _, row in session_df.iterrows() for s in ['fn', 'an'] if math.ceil(row[s] / 30) > 0]
+        sessions.sort(key=lambda x: (x[0], -x[2]))
 
         assigned_counts = {name: 0 for name in merged_df['name']}
         used_on_day = {d: set() for d in all_dates}
         duty_data = {name: {} for name in merged_df['name']}
-        staff_slot_assignment = {}
+        assigned_slots = {name: None for name in merged_df['name']}
+
+        # Parse ratio_choice and set duty caps
+        ratio_map = {
+            '1:3:6': {'Professor': 1, 'Assoc. Professor': 3, 'Asst. Professor': 6, 'A.P(Contract)': float('inf'), 'perm_ratio': 0.7, 'gl_ratio': 0.3},
+            '1:3:7': {'Professor': 1, 'Assoc. Professor': 3, 'Asst. Professor': 7, 'A.P(Contract)': float('inf'), 'perm_ratio': 0.7, 'gl_ratio': 0.3},
+            '1:4:8': {'Professor': 1, 'Assoc. Professor': 4, 'Asst. Professor': 8, 'A.P(Contract)': float('inf'), 'perm_ratio': 0.7, 'gl_ratio': 0.3}
+        }
+        if ratio_choice not in ratio_map:
+            logging.error(f"Invalid ratio choice: {ratio_choice}")
+            messagebox.showerror("Error", f"Invalid ratio choice: {ratio_choice}")
+            return None, None, None, None, {}
+        designation_caps = ratio_map[ratio_choice]
 
         ratio_violations = []
         duty_quota_violations = []
         slot_preference_violations = []
 
-        for date, session, needed, student_count in sessions:
-            used_on_day.setdefault(date, set())
-            remaining = needed
-            slot_of_date = 'Slot 1' if date in slot_dates['Slot 1'] else 'Slot 2'
+        # Assign duties for permanent staff (Professor, Assoc. Professor, Asst. Professor)
+        for desig in ['Professor', 'Assoc. Professor', 'Asst. Professor']:
+            candidates = merged_df[merged_df['designation'] == desig][['name', 'original_name', 'preferred slot', 'timestamp']]
+            candidates = sorted(candidates.to_dict('records'), key=lambda x: x['timestamp'] if not pd.isna(x['timestamp']) else pd.Timestamp.max) if desig == 'Asst. Professor' else candidates.to_dict('records')
 
-            def assign_perms(desg):
-                nonlocal remaining
-                perms = merged_df[merged_df['designation'] == desg]
-                if desg in ['Professor', 'Assoc. Professor']:
-                    perms = perms[perms['preferred slot'] == slot_of_date]
-                    perm_list = perms.to_dict('records')
-                else:
-                    pref = perms[perms['preferred slot'] == slot_of_date].sort_values('timestamp', na_position='last')
-                    anyp = perms[perms['preferred slot'] == 'Any'].sort_values('timestamp', na_position='last')
-                    perm_list = pd.concat([pref, anyp]).to_dict('records')
-                for p in perm_list:
-                    n = p['name']
-                    if assigned_counts[n] >= designation_caps[desg]:
-                        continue
-                    if n in used_on_day[date]:
-                        continue
-                    if n in staff_slot_assignment and staff_slot_assignment[n] != slot_of_date:
-                        continue
-                    if n not in staff_slot_assignment:
-                        staff_slot_assignment[n] = slot_of_date
-                    if can_assign(n, date, used_on_day):
-                        duty_data.setdefault(n, {})
-                        duty_data[n].setdefault(date, []).append(session)
-                        used_on_day[date].add(n)
-                        assigned_counts[n] += 1
-                        remaining -= 1
-                        if p['preferred slot'] != 'Any' and p['preferred slot'] != slot_of_date:
-                            slot_preference_violations.append(f"{p['original_name']} ({desg}) assigned to {slot_of_date} but preferred {p['preferred slot']}")
-                        if remaining == 0:
-                            break
-                return
+            for candidate in candidates:
+                name = candidate['name']
+                orig_name = candidate['original_name']
+                pref_slot = candidate['preferred slot'] if candidate['preferred slot'] in ['Slot 1', 'Slot 2'] else 'Any'
+                valid_slots = [pref_slot] if pref_slot in ['Slot 1', 'Slot 2'] else ['Slot 1', 'Slot 2']
+                duties_needed = designation_caps[desig]
+                assigned = 0
 
-            for d in ['Professor', 'Assoc. Professor', 'Asst. Professor']:
-                assign_perms(d)
-                if remaining == 0:
-                    break
+                # Prioritize slot with higher demand for APs with 'Any' preference
+                if pref_slot == 'Any' and desig == 'Asst. Professor':
+                    valid_slots = ['Slot 1', 'Slot 2'] if slot1_duties >= slot2_duties else ['Slot 2', 'Slot 1']
 
-            if remaining > 0:
-                gls = merged_df[merged_df['designation'] == 'A.P(Contract)']['name']
-                available_gls = [n for n in gls if n not in used_on_day[date]
-                                 and (n not in staff_slot_assignment or staff_slot_assignment[n] == slot_of_date)]
-                available_gls = sorted(available_gls, key=lambda x: assigned_counts[x])
-                for n in available_gls:
-                    if remaining == 0:
+                for slot in valid_slots:
+                    valid_dates = sorted(slot_dates[slot])
+                    for date, session, required in [(d, s, r) for d, s, r in sessions if d in valid_dates]:
+                        if name not in used_on_day[date] and assigned_counts[name] < duties_needed:
+                            current_slot = 'Slot 1' if date in slot_dates['Slot 1'] else 'Slot 2'
+                            if assigned_slots[name] is not None and assigned_slots[name] != current_slot:
+                                continue
+                            current_assigned = len([n for n in used_on_day[date] if date in duty_data[n] and session.upper() in duty_data[n][date]])
+                            perm_needed = math.ceil(required * designation_caps['perm_ratio'])
+                            perm_assigned = len([n for n in used_on_day[date] if date in duty_data[n] and session.upper() in duty_data[n][date] and merged_df[merged_df['name'] == n]['designation'].iloc[0] in ['Professor', 'Assoc. Professor', 'Asst. Professor']])
+                            if perm_assigned < perm_needed and current_assigned < required:
+                                duty_data[name][date] = duty_data[name].get(date, []) + [session.upper()]
+                                used_on_day[date].add(name)
+                                assigned_counts[name] += 1
+                                assigned += 1
+                                assigned_slots[name] = current_slot
+                                if pref_slot != 'Any' and pref_slot != current_slot:
+                                    slot_preference_violations.append(f"{orig_name} ({desig}) assigned to {current_slot} but preferred {pref_slot}")
+                                logging.info(f"Assigned {orig_name} ({desig}) to {date} {session} (Slot {current_slot})")
+                                if assigned == duties_needed:
+                                    break
+                    if assigned == duties_needed:
                         break
-                    if n not in staff_slot_assignment:
-                        staff_slot_assignment[n] = slot_of_date
-                    if can_assign(n, date, used_on_day):
-                        duty_data.setdefault(n, {})
-                        duty_data[n].setdefault(date, []).append(session)
-                        used_on_day[date].add(n)
-                        assigned_counts[n] += 1
-                        remaining -= 1
+                if assigned < duties_needed:
+                    duty_quota_violations.append(f"{orig_name} ({desig}) assigned {assigned}/{duties_needed} duties (preferred slot: {pref_slot})")
 
-            actually_assigned = sum(
-                1 for name in assigned_counts if name in duty_data and date in duty_data[name] and session in duty_data[name][date]
-            )
-            if actually_assigned < needed:
-                ratio_violations.append(f"{date} {session}: {needed} invigilators needed for {student_count} students, but only {actually_assigned} assigned.")
+        # Assign remaining duties to Guest Lecturers (A.P(Contract))
+        for date, session, required in sessions:
+            current_assigned = len([n for n in used_on_day[date] if date in duty_data[n] and session.upper() in duty_data[n][date]])
+            perm_assigned = len([n for n in used_on_day[date] if date in duty_data[n] and session.upper() in duty_data[n][date] and merged_df[merged_df['name'] == n]['designation'].iloc[0] in ['Professor', 'Assoc. Professor', 'Asst. Professor']])
+            perm_target = math.ceil(required * designation_caps['perm_ratio'])
+            if perm_assigned < perm_target:
+                ratio_violations.append(f"{date} {session}: Permanent staff ratio violation ({perm_assigned}/{perm_target} needed)")
+            remaining_needed = required - current_assigned
+            if remaining_needed > 0:
+                available_gls = sorted(
+                    [n for n in merged_df[merged_df['designation'] == 'A.P(Contract)']['name'] if n not in used_on_day[date]],
+                    key=lambda x: assigned_counts[x]
+                )
+                for name in available_gls[:remaining_needed]:
+                    orig_name = merged_df[merged_df['name'] == name]['original_name'].iloc[0]
+                    pref_slot = merged_df[merged_df['name'] == name]['preferred slot'].iloc[0]
+                    current_slot = 'Slot 1' if date in slot_dates['Slot 1'] else 'Slot 2'
+                    if assigned_slots[name] is not None and assigned_slots[name] != current_slot:
+                        continue
+                    duty_data[name][date] = duty_data[name].get(date, []) + [session.upper()]
+                    used_on_day[date].add(name)
+                    assigned_counts[name] += 1
+                    assigned_slots[name] = current_slot
+                    if pref_slot != 'Any' and pref_slot != current_slot:
+                        slot_preference_violations.append(f"{orig_name} (A.P(Contract)) assigned to {current_slot} but preferred {pref_slot}")
+                    logging.info(f"Assigned {orig_name} (A.P(Contract)) to {date} {session} (Slot {current_slot})")
 
-        # Report perm staff under-caps
-        for _, person in merged_df[merged_df["designation"].isin(["Professor", "Assoc. Professor", "Asst. Professor"])].iterrows():
-            name = person['name']
-            cap = designation_caps.get(person['designation'], 0)
-            assigned = assigned_counts.get(name, 0)
-            if assigned < cap:
-                duty_quota_violations.append(f"{person['original_name']} ({person['designation']}) assigned {assigned}/{cap} duties")
+        # Check for unassigned duties
+        for date, session, required in sessions:
+            current_assigned = len([n for n in used_on_day[date] if date in duty_data[n] and session.upper() in duty_data[n][date]])
+            if current_assigned != required:
+                logging.warning(f"Failed to assign all duties for {date} {session}: {current_assigned}/{required}")
+                duty_quota_violations.append(f"Failed to assign all duties for {date} {session}: {current_assigned}/{required}")
 
+        # Generate output Excel with additional analysis rows
         output_rows = []
-        for _, row in merged_df.iterrows():
-            name = row['name']
-            desig = row['designation']
-            orig_name = row['original_name']
-            dept = row['department'] if 'department' in merged_df.columns else ''
-            assigned_slot = staff_slot_assignment.get(name)
-            assigned_slot_str = assigned_slot if assigned_slot in ['Slot 1', 'Slot 2'] else 'None'
-            total_duties = assigned_counts.get(name, 0)
-            user_row = {'Name': orig_name, 'Designation': desig, 'Department': dept,
-                        'Total Duties': total_duties, 'Assigned Slot': assigned_slot_str}
+        for name in merged_df['name']:
+            desig = merged_df[merged_df['name'] == name]['designation'].iloc[0]
+            orig_name = merged_df[merged_df['name'] == name]['original_name'].iloc[0]
+            dept = merged_df[merged_df['name'] == name]['department'].iloc[0]
+            row = {'Name': orig_name, 'Designation': desig, 'Department': dept}
             for d in all_dates:
-                sessions_assigned = duty_data.get(name, {}).get(d, [])
-                user_row[d] = ' '.join(sessions_assigned) if sessions_assigned else ''
-            output_rows.append(user_row)
+                sessions = duty_data.get(name, {}).get(d, [])
+                row[d] = ' '.join(sessions) if sessions else ''
+            total_duties = sum(len(duty_data[name].get(d, [])) for d in all_dates)
+            assigned_slot = assigned_slots[name] if assigned_slots[name] is not None else "None"
+            row['Total Duties'] = total_duties
+            row['Assigned Slot'] = assigned_slot
+            output_rows.append(row)
 
         output_df = pd.DataFrame(output_rows)
-        col_order = ['Name', 'Designation', 'Department', 'Total Duties', 'Assigned Slot'] + all_dates
-        output_df = output_df[col_order]
+        output_df.insert(0, 'Name', output_df.pop('Name'))
+        output_df.insert(1, 'Designation', output_df.pop('Designation'))
+        output_df.insert(2, 'Department', output_df.pop('Department'))
+        output_df.insert(3, 'Total Duties', output_df.pop('Total Duties'))
+        output_df.insert(4, 'Assigned Slot', output_df.pop('Assigned Slot'))
+
+        # Add analysis rows
+        fn_duties_row = {'Name': 'Total FN Duties', 'Designation': '', 'Department': '', 'Total Duties': '', 'Assigned Slot': ''}
+        an_duties_row = {'Name': 'Total AN Duties', 'Designation': '', 'Department': '', 'Total Duties': '', 'Assigned Slot': ''}
+        fn_perm_pct_row = {'Name': 'FN Permanent %', 'Designation': '', 'Department': '', 'Total Duties': '', 'Assigned Slot': ''}
+        an_perm_pct_row = {'Name': 'AN Permanent %', 'Designation': '', 'Department': '', 'Total Duties': '', 'Assigned Slot': ''}
+
+        for date in all_dates:
+            fn_count = sum(1 for name in merged_df['name'] if date in duty_data.get(name, {}) and 'FN' in duty_data[name][date])
+            an_count = sum(1 for name in merged_df['name'] if date in duty_data.get(name, {}) and 'AN' in duty_data[name][date])
+            fn_perm_count = sum(1 for name in merged_df[merged_df['designation'].isin(['Professor', 'Assoc. Professor', 'Asst. Professor'])]['name'] if date in duty_data.get(name, {}) and 'FN' in duty_data[name][date])
+            an_perm_count = sum(1 for name in merged_df[merged_df['designation'].isin(['Professor', 'Assoc. Professor', 'Asst. Professor'])]['name'] if date in duty_data.get(name, {}) and 'AN' in duty_data[name][date])
+            fn_duties_row[date] = fn_count
+            an_duties_row[date] = an_count
+            fn_perm_pct_row[date] = f"{(fn_perm_count / fn_count * 100):.1f}%" if fn_count > 0 else '0.0%'
+            an_perm_pct_row[date] = f"{(an_perm_count / an_count * 100):.1f}%" if an_count > 0 else '0.0%'
+
+        output_df = pd.concat([output_df, pd.DataFrame([fn_duties_row, an_duties_row, fn_perm_pct_row, an_perm_pct_row])], ignore_index=True)
         output_df.to_excel(output_path, index=False)
 
-        total = sum(assigned_counts.values())
-        prof_count = sum(assigned_counts[n] for n in merged_df[merged_df['designation'] == 'Professor']['name'])
-        asp_count = sum(assigned_counts[n] for n in merged_df[merged_df['designation'] == 'Assoc. Professor']['name'])
-        ap_count = sum(assigned_counts[n] for n in merged_df[merged_df['designation'] == 'Asst. Professor']['name'])
-        gl_count = sum(assigned_counts[n] for n in merged_df[merged_df['designation'] == 'A.P(Contract)']['name'])
-        summary = f"Final chart (Ratio: {ratio_choice}): {prof_count} Professor, {asp_count} Assoc. Professor, {ap_count} Asst. Professor, {gl_count} A.P(Contract), Total duties assigned: {total}"
-        return summary, ratio_violations, duty_quota_violations, slot_preference_violations, merged_df[['name', 'original_name']].set_index('name')['original_name'].to_dict()
+        total_duties = sum(assigned_counts.values())
+        prof_duties = sum(assigned_counts[name] for name in merged_df[merged_df['designation'] == 'Professor']['name'])
+        asp_duties = sum(assigned_counts[name] for name in merged_df[merged_df['designation'] == 'Assoc. Professor']['name'])
+        ap_duties = sum(assigned_counts[name] for name in merged_df[merged_df['designation'] == 'Asst. Professor']['name'])
+        gl_duties = sum(assigned_counts[name] for name in merged_df[merged_df['designation'] == 'A.P(Contract)']['name'])
+        assignment_summary = f"Final chart (Ratio: {ratio_choice}): {prof_duties} Professor, {asp_duties} Assoc. Professor, {ap_duties} Asst. Professor, {gl_duties} A.P(Contract), Total: {total_duties}\n"
+        return assignment_summary, ratio_violations, duty_quota_violations, slot_preference_violations, merged_df[['name', 'original_name']].set_index('name')['original_name'].to_dict()
 
     except Exception as e:
         logging.error(f"Failed to generate chart: {str(e)}")
         messagebox.showerror("Error", f"Failed to generate chart: {str(e)}\nCheck duty_chart_app.log for details.")
-        return None, [], [], [], {}
-
+        return None, None, None, None, {}
 # ==================== GUI ====================
 class DutyChartApp:
     def __init__(self, root):
