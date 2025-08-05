@@ -241,7 +241,7 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range, ratio
         logging.info(f"Slot 1 needs {slot1_duties} duties, Slot 2 needs {slot2_duties} duties")
 
         sessions = [(row['date'], s, math.ceil(row[s] / 30)) for _, row in session_df.iterrows() for s in ['fn', 'an'] if math.ceil(row[s] / 30) > 0]
-        sessions.sort(key=lambda x: (x[0], -x[2]))
+        sessions.sort(key=lambda x: (x[0], x[1]))  # Sort by date, then FN before AN
 
         assigned_counts = {name: 0 for name in merged_df['name']}
         used_on_day = {d: set() for d in all_dates}
@@ -260,15 +260,27 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range, ratio
             return None, None, None, None, {}
         designation_caps = ratio_map[ratio_choice]
 
+        # Check if enough duties are available for exact caps
+        total_duties_needed = sum(
+            len(merged_df[merged_df['designation'] == desig]) * cap
+            for desig, cap in designation_caps.items() if desig != 'A.P(Contract)'
+        )
+        total_duties_available = sum(r for _, _, r in sessions)
+        if total_duties_needed > total_duties_available:
+            logging.warning(f"Insufficient sessions to meet exact duty caps: {total_duties_needed} needed, {total_duties_available} available")
+            duty_quota_violations.append(f"Insufficient sessions: {total_duties_needed} duties needed, {total_duties_available} available")
+
         ratio_violations = []
         duty_quota_violations = []
         slot_preference_violations = []
+        slot_split_violations = []
 
         # Assign duties for permanent staff (Professor, Assoc. Professor, Asst. Professor)
         for desig in ['Professor', 'Assoc. Professor', 'Asst. Professor']:
             candidates = merged_df[merged_df['designation'] == desig][['name', 'original_name', 'preferred slot', 'timestamp']]
-            candidates = sorted(candidates.to_dict('records'), key=lambda x: x['timestamp'] if not pd.isna(x['timestamp']) else pd.Timestamp.max) if desig == 'Asst. Professor' else candidates.to_dict('records')
+            candidates = sorted(candidates.to_dict('records'), key=lambda x: (x['timestamp'] if not pd.isna(x['timestamp']) else pd.Timestamp.max, x['name'])) if desig == 'Asst. Professor' else candidates.to_dict('records')
 
+            # Pass 1: Assign within preferred slots, 70:30 ratio
             for candidate in candidates:
                 name = candidate['name']
                 orig_name = candidate['original_name']
@@ -299,21 +311,76 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range, ratio
                                 assigned_slots[name] = current_slot
                                 if pref_slot != 'Any' and pref_slot != current_slot:
                                     slot_preference_violations.append(f"{orig_name} ({desig}) assigned to {current_slot} but preferred {pref_slot}")
-                                logging.info(f"Assigned {orig_name} ({desig}) to {date} {session} (Slot {current_slot})")
+                                logging.info(f"Pass 1: Assigned {orig_name} ({desig}) to {date} {session} (Slot {current_slot})")
                                 if assigned == duties_needed:
                                     break
                     if assigned == duties_needed:
                         break
+
+                # Pass 2: Assign within preferred slots, 80:20 ratio
                 if assigned < duties_needed:
-                    duty_quota_violations.append(f"{orig_name} ({desig}) assigned {assigned}/{duties_needed} duties (preferred slot: {pref_slot})")
+                    logging.info(f"Pass 2: Adjusting to 80:20 for {orig_name} ({desig}) to meet {duties_needed} duties")
+                    for slot in valid_slots:
+                        valid_dates = sorted(slot_dates[slot])
+                        for date, session, required in [(d, s, r) for d, s, r in sessions if d in valid_dates]:
+                            if name not in used_on_day[date] and assigned_counts[name] < duties_needed:
+                                current_slot = 'Slot 1' if date in slot_dates['Slot 1'] else 'Slot 2'
+                                if assigned_slots[name] is not None and assigned_slots[name] != current_slot:
+                                    continue
+                                current_assigned = len([n for n in used_on_day[date] if date in duty_data[n] and session.upper() in duty_data[n][date]])
+                                perm_needed = math.ceil(required * 0.8)
+                                perm_assigned = len([n for n in used_on_day[date] if date in duty_data[n] and session.upper() in duty_data[n][date] and merged_df[merged_df['name'] == n]['designation'].iloc[0] in ['Professor', 'Assoc. Professor', 'Asst. Professor']])
+                                if perm_assigned < perm_needed and current_assigned < required:
+                                    duty_data[name][date] = duty_data[name].get(date, []) + [session.upper()]
+                                    used_on_day[date].add(name)
+                                    assigned_counts[name] += 1
+                                    assigned += 1
+                                    assigned_slots[name] = current_slot
+                                    if pref_slot != 'Any' and pref_slot != current_slot:
+                                        slot_preference_violations.append(f"{orig_name} ({desig}) assigned to {current_slot} but preferred {pref_slot}")
+                                    logging.info(f"Pass 2: Assigned {orig_name} ({desig}) to {date} {session} (Slot {current_slot}, 80:20)")
+                                    if assigned == duties_needed:
+                                        break
+                        if assigned == duties_needed:
+                            break
+
+            # Pass 3: For APs, assign in any slot to meet exact cap
+            if desig == 'Asst. Professor':
+                candidates = sorted(candidates, key=lambda x: assigned_counts[x['name']])  # Sort by current duties for fairness
+                for candidate in candidates:
+                    name = candidate['name']
+                    orig_name = candidate['original_name']
+                    duties_needed = designation_caps[desig]
+                    assigned = assigned_counts[name]
+                    if assigned < duties_needed:
+                        logging.info(f"Pass 3: Assigning {orig_name} ({desig}) to any slot to meet {duties_needed} duties")
+                        for date, session, required in sessions:
+                            if name not in used_on_day[date] and assigned_counts[name] < duties_needed:
+                                current_slot = 'Slot 1' if date in slot_dates['Slot 1'] else 'Slot 2'
+                                if assigned_slots[name] is not None and assigned_slots[name] != current_slot:
+                                    slot_split_violations.append(f"{orig_name} ({desig}) assigned across slots ({assigned_slots[name]} and {current_slot}) to meet {duties_needed} duties")
+                                current_assigned = len([n for n in used_on_day[date] if date in duty_data[n] and session.upper() in duty_data[n][date]])
+                                if current_assigned < required:
+                                    duty_data[name][date] = duty_data[name].get(date, []) + [session.upper()]
+                                    used_on_day[date].add(name)
+                                    assigned_counts[name] += 1
+                                    assigned += 1
+                                    assigned_slots[name] = assigned_slots[name] or current_slot
+                                    logging.info(f"Pass 3: Assigned {orig_name} ({desig}) to {date} {session} (Slot {current_slot})")
+                                    if assigned == duties_needed:
+                                        break
+                    if assigned < duties_needed:
+                        duty_quota_violations.append(f"{orig_name} ({desig}) assigned {assigned}/{duties_needed} duties")
 
         # Assign remaining duties to Guest Lecturers (A.P(Contract))
         for date, session, required in sessions:
             current_assigned = len([n for n in used_on_day[date] if date in duty_data[n] and session.upper() in duty_data[n][date]])
             perm_assigned = len([n for n in used_on_day[date] if date in duty_data[n] and session.upper() in duty_data[n][date] and merged_df[merged_df['name'] == n]['designation'].iloc[0] in ['Professor', 'Assoc. Professor', 'Asst. Professor']])
-            perm_target = math.ceil(required * designation_caps['perm_ratio'])
-            if perm_assigned < perm_target:
+            perm_target = math.ceil(required * (0.8 if perm_assigned > math.ceil(required * 0.7) else 0.7))
+            if perm_assigned < math.ceil(required * 0.7):
                 ratio_violations.append(f"{date} {session}: Permanent staff ratio violation ({perm_assigned}/{perm_target} needed)")
+            elif perm_assigned > math.ceil(required * 0.7):
+                ratio_violations.append(f"{date} {session}: Adjusted to 80:20 ratio ({perm_assigned}/{required} permanent duties)")
             remaining_needed = required - current_assigned
             if remaining_needed > 0:
                 available_gls = sorted(
@@ -324,29 +391,28 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range, ratio
                     orig_name = merged_df[merged_df['name'] == name]['original_name'].iloc[0]
                     pref_slot = merged_df[merged_df['name'] == name]['preferred slot'].iloc[0]
                     current_slot = 'Slot 1' if date in slot_dates['Slot 1'] else 'Slot 2'
-                    if assigned_slots[name] is not None and assigned_slots[name] != current_slot:
-                        continue
                     duty_data[name][date] = duty_data[name].get(date, []) + [session.upper()]
                     used_on_day[date].add(name)
                     assigned_counts[name] += 1
-                    assigned_slots[name] = current_slot
+                    assigned_slots[name] = current_slot if assigned_slots[name] is None else assigned_slots[name]
                     if pref_slot != 'Any' and pref_slot != current_slot:
                         slot_preference_violations.append(f"{orig_name} (A.P(Contract)) assigned to {current_slot} but preferred {pref_slot}")
                     logging.info(f"Assigned {orig_name} (A.P(Contract)) to {date} {session} (Slot {current_slot})")
 
-        # Check for unassigned duties
+        # Verify exact duty assignments
         for date, session, required in sessions:
             current_assigned = len([n for n in used_on_day[date] if date in duty_data[n] and session.upper() in duty_data[n][date]])
             if current_assigned != required:
-                logging.warning(f"Failed to assign all duties for {date} {session}: {current_assigned}/{required}")
-                duty_quota_violations.append(f"Failed to assign all duties for {date} {session}: {current_assigned}/{required}")
+                logging.warning(f"Failed to assign exact duties for {date} {session}: {current_assigned}/{required}")
+                duty_quota_violations.append(f"Failed to assign exact duties for {date} {session}: {current_assigned}/{required}")
 
-        # Generate output Excel with additional analysis rows
+        # Generate output Excel with Preferred Slot column
         output_rows = []
         for name in merged_df['name']:
             desig = merged_df[merged_df['name'] == name]['designation'].iloc[0]
             orig_name = merged_df[merged_df['name'] == name]['original_name'].iloc[0]
             dept = merged_df[merged_df['name'] == name]['department'].iloc[0]
+            pref_slot = merged_df[merged_df['name'] == name]['preferred slot'].iloc[0]
             row = {'Name': orig_name, 'Designation': desig, 'Department': dept}
             for d in all_dates:
                 sessions = duty_data.get(name, {}).get(d, [])
@@ -354,6 +420,7 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range, ratio
             total_duties = sum(len(duty_data[name].get(d, [])) for d in all_dates)
             assigned_slot = assigned_slots[name] if assigned_slots[name] is not None else "None"
             row['Total Duties'] = total_duties
+            row['Preferred Slot'] = pref_slot
             row['Assigned Slot'] = assigned_slot
             output_rows.append(row)
 
@@ -362,13 +429,14 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range, ratio
         output_df.insert(1, 'Designation', output_df.pop('Designation'))
         output_df.insert(2, 'Department', output_df.pop('Department'))
         output_df.insert(3, 'Total Duties', output_df.pop('Total Duties'))
-        output_df.insert(4, 'Assigned Slot', output_df.pop('Assigned Slot'))
+        output_df.insert(4, 'Preferred Slot', output_df.pop('Preferred Slot'))
+        output_df.insert(5, 'Assigned Slot', output_df.pop('Assigned Slot'))
 
         # Add analysis rows
-        fn_duties_row = {'Name': 'Total FN Duties', 'Designation': '', 'Department': '', 'Total Duties': '', 'Assigned Slot': ''}
-        an_duties_row = {'Name': 'Total AN Duties', 'Designation': '', 'Department': '', 'Total Duties': '', 'Assigned Slot': ''}
-        fn_perm_pct_row = {'Name': 'FN Permanent %', 'Designation': '', 'Department': '', 'Total Duties': '', 'Assigned Slot': ''}
-        an_perm_pct_row = {'Name': 'AN Permanent %', 'Designation': '', 'Department': '', 'Total Duties': '', 'Assigned Slot': ''}
+        fn_duties_row = {'Name': 'Total FN Duties', 'Designation': '', 'Department': '', 'Total Duties': '', 'Preferred Slot': '', 'Assigned Slot': ''}
+        an_duties_row = {'Name': 'Total AN Duties', 'Designation': '', 'Department': '', 'Total Duties': '', 'Preferred Slot': '', 'Assigned Slot': ''}
+        fn_perm_pct_row = {'Name': 'FN Permanent %', 'Designation': '', 'Department': '', 'Total Duties': '', 'Preferred Slot': '', 'Assigned Slot': ''}
+        an_perm_pct_row = {'Name': 'AN Permanent %', 'Designation': '', 'Department': '', 'Total Duties': '', 'Preferred Slot': '', 'Assigned Slot': ''}
 
         for date in all_dates:
             fn_count = sum(1 for name in merged_df['name'] if date in duty_data.get(name, {}) and 'FN' in duty_data[name][date])
@@ -389,7 +457,7 @@ def generate_duty_chart(input_path, output_path, slot1_range, slot2_range, ratio
         ap_duties = sum(assigned_counts[name] for name in merged_df[merged_df['designation'] == 'Asst. Professor']['name'])
         gl_duties = sum(assigned_counts[name] for name in merged_df[merged_df['designation'] == 'A.P(Contract)']['name'])
         assignment_summary = f"Final chart (Ratio: {ratio_choice}): {prof_duties} Professor, {asp_duties} Assoc. Professor, {ap_duties} Asst. Professor, {gl_duties} A.P(Contract), Total: {total_duties}\n"
-        return assignment_summary, ratio_violations, duty_quota_violations, slot_preference_violations, merged_df[['name', 'original_name']].set_index('name')['original_name'].to_dict()
+        return assignment_summary, ratio_violations, duty_quota_violations, slot_preference_violations + slot_split_violations, merged_df[['name', 'original_name']].set_index('name')['original_name'].to_dict()
 
     except Exception as e:
         logging.error(f"Failed to generate chart: {str(e)}")
