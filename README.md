@@ -2,7 +2,7 @@
 
 **Automates exam duty assignment** for **50+ staff** across **30+ dates** using **70:30 ratio**, **slot preferences**, and **designation hierarchy**.
 
-**Used by Government College of Engineering, Salem** exam cell.  
+**Currently Used by Government College of Engineering, Salem** exam cell.  
 **Saves 12+ hours** per exam schedule.
 
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
@@ -64,15 +64,18 @@ python main.py
 
 ## Project Structure
 
+```text
 DutyChart/
-├── core/          to Business logic (parser, matcher, scheduler)
-├── gui/           to Tkinter interface
-├── config/        to Logging setup
-├── assets/        to Logo
-├── samples/       to Test input/output
-├── screenshots/   to Demo images
-├── main.py        to Entry point
+├── core/          → Business logic (parser, matcher, scheduler)
+├── gui/           → Tkinter interface
+├── config/        → Logging setup
+├── assets/        → Logo
+├── samples/       → Test input/output
+├── screenshots/   → Demo images
+├── main.py        → Entry point
 └── requirements.txt
+```
+---
 
 ## Tech Stack
 
@@ -90,4 +93,4 @@ DutyChart/
 **Vasudevan**  
 CSE Student, Government College of Engineering, Salem  
 
-[GitHub](https://github.com/Vasu-Dev-arch) | [LinkedIn](https://linkedin.com/in/vasudevan-j) | [Portfolio](https://vasudev-portfolio.netlify.app)
+<a href="https://github.com/Vasu-Dev-arch" target="_blank">Github</a> | <a href="https://linkedin.com/in/vasudevan-j" target="_blank">LinkedIn</a> | <a href="https://vasu-dev-portfolio.netlify.app" target="_blank">Portfolio</a>
