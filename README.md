@@ -93,4 +93,4 @@ DutyChart/
 **Vasudevan**  
 CSE Student, Government College of Engineering, Salem  
 
-<a href="https://github.com/Vasu-Dev-arch" target="_blank">Github</a> | <a href="https://linkedin.com/in/vasudevan-j" target="_blank">LinkedIn</a> | <a href="https://vasu-dev-portfolio.netlify.app" target="_blank">Portfolio</a>
+<a href="https://github.com/Vasu-Dev-arch" target="_blank">Github</a> | <a href="https://linkedin.com/in/vasudevan-j" target="_blank">LinkedIn</a> | <a href="https://vasu-dev-arch.github.io/New-Portfolio" target="_blank">Portfolio</a>
